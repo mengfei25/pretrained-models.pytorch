@@ -14,6 +14,8 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
 import sys
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 
 sys.path.append('.')
 import pretrainedmodels
@@ -57,13 +59,16 @@ parser.add_argument('--do-not-preserve-aspect-ratio',
                     dest='preserve_aspect_ratio',
                     help='do not preserve the aspect ratio when resizing an image',
                     action='store_false')
+parser.add_argument('--device', type=str, default='cpu', help='device')
+
 parser.set_defaults(preserve_aspect_ratio=True)
 best_prec1 = 0
 
 
 def main():
-    global args, best_prec1
+    global args, best_prec1, device
     args = parser.parse_args()
+    device = torch.device(args.device)
 
     # create model
     print("=> creating model '{}'".format(args.arch))
@@ -127,13 +132,13 @@ def main():
         num_workers=args.workers, pin_memory=True)
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
-    model = torch.nn.DataParallel(model).cuda()
+    model = torch.nn.DataParallel(model).to(device)
 
     if args.evaluate:
         validate(val_loader, model, criterion)
@@ -174,7 +179,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        target = target.cuda()
+        target = target.to(device)
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
 
@@ -220,8 +225,8 @@ def validate(val_loader, model, criterion):
 
         end = time.time()
         for i, (input, target) in enumerate(val_loader):
-            target = target.cuda()
-            input = input.cuda()
+            target = target.to(device)
+            input = input.to(device)
 
             # compute output
             output = model(input)
@@ -295,7 +300,7 @@ def accuracy(output, target, topk=(1,)):
 
     res = []
     for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0)
+        correct_k = correct[:k].reshape(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
