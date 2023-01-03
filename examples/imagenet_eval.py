@@ -59,7 +59,17 @@ parser.add_argument('--do-not-preserve-aspect-ratio',
                     dest='preserve_aspect_ratio',
                     help='do not preserve the aspect ratio when resizing an image',
                     action='store_false')
+# for oob
 parser.add_argument('--device', type=str, default='cpu', help='device')
+parser.add_argument('--precision', type=str, default='float32', help='precision')
+parser.add_argument('--channels_last', type=int, default=1, help='use channels last format')
+# parser.add_argument('--batch_size', type=int, default=1, help='batch_size')
+parser.add_argument('--num_iter', type=int, default=-1, help='num_iter')
+parser.add_argument('--num_warmup', type=int, default=-1, help='num_warmup')
+parser.add_argument('--profile', dest='profile', action='store_true', help='profile')
+parser.add_argument('--quantized_engine', type=str, default=None, help='quantized_engine')
+parser.add_argument('--ipex', dest='ipex', action='store_true', help='ipex')
+parser.add_argument('--jit', dest='jit', action='store_true', help='jit')
 
 parser.set_defaults(preserve_aspect_ratio=True)
 best_prec1 = 0
@@ -139,9 +149,58 @@ def main():
                                 weight_decay=args.weight_decay)
 
     model = torch.nn.DataParallel(model).to(device)
+    # NHWC
+    if args.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+        print("---- Use NHWC model")
 
     if args.evaluate:
-        validate(val_loader, model, criterion)
+        if args.profile:
+            def trace_handler(p):
+                output = p.key_averages().table(sort_by="self_cpu_time_total")
+                print(output)
+                import pathlib
+                timeline_dir = str(pathlib.Path.cwd()) + '/timeline/'
+                if not os.path.exists(timeline_dir):
+                    try:
+                        os.makedirs(timeline_dir)
+                    except:
+                        pass
+                timeline_file = timeline_dir + 'timeline-' + str(torch.backends.quantized.engine) + '-' + \
+                            args.arch + '-' + str(p.step_num) + '-' + str(os.getpid()) + '.json'
+                p.export_chrome_trace(timeline_file)
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                record_shapes=True,
+                schedule=torch.profiler.schedule(
+                    wait=int(args.num_iter/2),
+                    warmup=2,
+                    active=1,
+                ),
+                on_trace_ready=trace_handler,
+            ) as p:
+                args.p = p
+                if args.precision == "bfloat16":
+                    print('---- Enable AMP bfloat16')
+                    with torch.cpu.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                        validate(val_loader, model, criterion)
+                elif args.precision == "float16":
+                    print('---- Enable AMP float16')
+                    with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+                        validate(val_loader, model, criterion)
+                else:
+                    validate(val_loader, model, criterion)
+        else:
+            if args.precision == "bfloat16":
+                print('---- Enable AMP bfloat16')
+                with torch.cpu.amp.autocast(enabled=True, dtype=torch.bfloat16):
+                    validate(val_loader, model, criterion)
+            elif args.precision == "float16":
+                print('---- Enable AMP float16')
+                with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+                    validate(val_loader, model, criterion)
+            else:
+                validate(val_loader, model, criterion)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -222,16 +281,28 @@ def validate(val_loader, model, criterion):
 
         # switch to evaluate mode
         model.eval()
-
+        total_time = 0.0
+        total_sample = 0
         end = time.time()
         for i, (input, target) in enumerate(val_loader):
+            if args.num_iter > 0 and i >= args.num_iter: break
+            if args.channels_last:
+                input = input.contiguous(memory_format=torch.channels_last)
+
+            elapsed = time.time()
             target = target.to(device)
             input = input.to(device)
-
             # compute output
             output = model(input)
             loss = criterion(output, target)
-
+            if torch.cuda.is_available(): torch.cuda.synchronize()
+            elapsed = time.time() - elapsed
+            if args.profile:
+                args.p.step()
+            print("Iteration: {}, inference time: {} sec.".format(i, elapsed), flush=True)
+            if i >= args.num_warmup:
+                total_time += elapsed
+                total_sample += args.batch_size
             # measure accuracy and record loss
             prec1, prec5 = accuracy(output.data, target.data, topk=(1, 5))
             losses.update(loss.data.item(), input.size(0))
@@ -250,7 +321,10 @@ def validate(val_loader, model, criterion):
                       'Acc@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                        i, len(val_loader), batch_time=batch_time, loss=losses,
                        top1=top1, top5=top5))
-
+        throughput = total_sample / total_time
+        latency = total_time / total_sample * 1000
+        print('inference latency: %.3f ms' % latency)
+        print('inference Throughput: %f images/s' % throughput)
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
 
